@@ -6,7 +6,7 @@ import re
 
 st.set_page_config(page_title="監測儀器濾波與異常值消除工具", page_icon="🎛️", layout="wide")
 st.title("🎛️ 監測資料濾波與突波消除專用工具")
-st.write("上傳監測儀器原始檔，透過專業訊號演算法找出異常突波並自動修補，解決正常暴雨訊號被誤判的問題。")
+st.write("上傳監測儀器原始檔，透過專業訊號演算法找出異常突波並自動修補，並在匯出前預覽最終乾淨歷線。")
 
 # --- 讀取與清理資料模組 ---
 @st.cache_data
@@ -56,7 +56,6 @@ if uploaded_file:
     st.sidebar.markdown("---")
     st.sidebar.header("🎛️ 2. 濾波演算法設定")
     
-    # 升級版的濾波選項
     filter_options = [
         "相鄰突變檢測 (強烈推薦：精準抓單點突波)",
         "移動中位數檢定 (Hampel Filter - 適合大範圍雜訊)", 
@@ -74,36 +73,27 @@ if uploaded_file:
         max_val = st.sidebar.number_input("合理最大值", value=float(df[target_col].max() + 5))
         df_clean.loc[(df_clean[target_col] < min_val) | (df_clean[target_col] > max_val), 'is_outlier'] = True
         
-    # 演算法 2：相鄰突變檢測 (一階差分)
+    # 演算法 2：相鄰突變檢測
     elif filter_method == "相鄰突變檢測 (強烈推薦：精準抓單點突波)":
         st.sidebar.write("💡 真正的儀器突波通常會「瞬間飆高又瞬間跌回」。此演算法會比較當前數值與「前後一筆」的落差，完美保留颱風豪雨的真實階梯式爬升。")
-        
-        # 自動建議一個合理的跳動閾值 (大約是整體標準差的 1 到 2 倍)
         suggested_jump = float(df[target_col].std() * 1.5) if pd.notnull(df[target_col].std()) else 1.0
         max_jump = st.sidebar.number_input("允許的最大瞬間跳動量 (Threshold)", value=suggested_jump, min_value=0.01, step=0.1)
         
-        # 計算與前一筆、後一筆的絕對差值
         diff_prev = (df_clean[target_col] - df_clean[target_col].shift(1)).abs()
         diff_next = (df_clean[target_col] - df_clean[target_col].shift(-1)).abs()
-        
-        # 當一個點跟「前一個」與「後一個」的差距都大於閾值時，才被判定為突波
         mask = (diff_prev > max_jump) & (diff_next > max_jump)
         df_clean.loc[mask, 'is_outlier'] = True
 
-    # 演算法 3：Hampel Filter (移動中位數)
+    # 演算法 3：Hampel Filter
     elif filter_method == "移動中位數檢定 (Hampel Filter - 適合大範圍雜訊)":
         st.sidebar.write("💡 用「中位數」取代「平均數」，不容易被極端值拉偏判定基準，比傳統移動標準差更精準。")
         window_size = st.sidebar.slider("移動視窗大小 (筆數)", min_value=5, max_value=200, value=24)
         z_score = st.sidebar.slider("嚴格程度 (Z-Score 倍數)", min_value=1.0, max_value=10.0, value=3.0, step=0.5)
         
-        # 計算移動中位數與絕對中位差 (MAD)
         rolling_median = df_clean[target_col].rolling(window=window_size, center=True, min_periods=1).median()
         mad = (df_clean[target_col] - rolling_median).abs().rolling(window=window_size, center=True, min_periods=1).median()
-        
-        # 避免 MAD 為 0 時把微小波動當成突波，設定一個基本容忍值 (0.1)
         threshold = np.maximum(z_score * 1.4826 * mad, 0.1)
         diff = (df_clean[target_col] - rolling_median).abs()
-        
         df_clean.loc[diff > threshold, 'is_outlier'] = True
 
     st.sidebar.markdown("---")
@@ -128,42 +118,9 @@ if uploaded_file:
     col1.metric("總資料筆數", f"{total_count:,} 筆")
     col2.metric("抓出的異常突波", f"{outlier_count:,} 筆", f"{outlier_pct:.2f}% 剔除率", delta_color="inverse")
     
-    st.markdown("### 🔍 濾波效果比對圖")
-    st.write("淺藍色實線為修復後的資料；🔴 紅色點為被系統判定為異常並剔除的原始突波。")
-    
-    fig = go.Figure()
-    
-    # 修復後的線
-    fig.add_trace(
-        go.Scatter(
-            x=df_clean[time_col], y=df_clean['Cleaned_Value'], 
-            mode='lines', name="修復後平滑資料", 
-            line=dict(color="#1f77b4", width=2)
-        )
-    )
-    
-    # 異常紅點
-    df_outliers = df_clean[df_clean['is_outlier']]
-    if not df_outliers.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=df_outliers[time_col], y=df_outliers[target_col], 
-                mode='markers', name="被剔除的異常突波", 
-                marker=dict(color="red", size=6, symbol="x")
-            )
-        )
-        
-    fig.update_layout(
-        template="plotly_white",
-        hovermode="x unified",
-        height=550,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        xaxis_title="時間",
-        yaxis_title="監測數值"
-    )
-    
-    # Y 軸鎖定功能
+    # --- Y 軸鎖定設定 (套用於兩個分頁圖表) ---
     use_manual_y = st.checkbox("手動鎖定 Y 軸範圍 (放大檢視不跑版)")
+    y_min, y_max = None, None
     if use_manual_y:
         col_y1, col_y2 = st.columns(2)
         suggest_min = float(df_clean['Cleaned_Value'].min() - 2) if not df_clean['Cleaned_Value'].isna().all() else 0.0
@@ -172,11 +129,34 @@ if uploaded_file:
             y_min = st.number_input("Y 軸下限", value=suggest_min)
         with col_y2:
             y_max = st.number_input("Y 軸上限", value=suggest_max)
-        fig.update_yaxes(range=[y_min, y_max])
-    else:
-        fig.update_yaxes(autorange=True)
-        
-    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
+
+    # --- 新增功能：分頁 (Tabs) 顯示不同的圖表 ---
+    tab1, tab2 = st.tabs(["🔍 濾波效果比對 (含異常標記)", "✨ 修復後最終成果 (純淨歷線)"])
+    
+    # 圖表 1：比對圖
+    with tab1:
+        st.write("淺藍色實線為修復後的資料；🔴 紅色點為被系統判定為異常並剔除的原始突波。")
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(x=df_clean[time_col], y=df_clean['Cleaned_Value'], mode='lines', name="修復後平滑資料", line=dict(color="#1f77b4", width=2)))
+        df_outliers = df_clean[df_clean['is_outlier']]
+        if not df_outliers.empty:
+            fig1.add_trace(go.Scatter(x=df_outliers[time_col], y=df_outliers[target_col], mode='markers', name="被剔除的異常突波", marker=dict(color="red", size=6, symbol="x")))
+            
+        fig1.update_layout(template="plotly_white", hovermode="x unified", height=550, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+        if use_manual_y: fig1.update_yaxes(range=[y_min, y_max])
+        else: fig1.update_yaxes(autorange=True)
+        st.plotly_chart(fig1, use_container_width=True, config={"scrollZoom": True})
+
+    # 圖表 2：最終乾淨版
+    with tab2:
+        st.write("這是最終即將匯出的乾淨資料歷線，您可以清楚確認濾波與修補的效果是否符合預期。")
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df_clean[time_col], y=df_clean['Cleaned_Value'], mode='lines', name="最終修復資料", line=dict(color="#1f77b4", width=2)))
+            
+        fig2.update_layout(template="plotly_white", hovermode="x unified", height=550, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+        if use_manual_y: fig2.update_yaxes(range=[y_min, y_max])
+        else: fig2.update_yaxes(autorange=True)
+        st.plotly_chart(fig2, use_container_width=True, config={"scrollZoom": True})
     
     # --- 匯出資料 ---
     st.markdown("---")
