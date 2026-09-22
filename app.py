@@ -6,7 +6,7 @@ import re
 
 st.set_page_config(page_title="監測儀器濾波與異常值消除工具", page_icon="🎛️", layout="wide")
 st.title("🎛️ 監測資料濾波與突波消除專用工具")
-st.write("上傳監測儀器原始檔，支援多種濾波演算法、手動區間剔除與平滑化處理，適用於水位、GPS、伸縮計等各類訊號。")
+st.write("上傳監測儀器原始檔，支援多種濾波演算法、日曆點選剔除與平滑化處理，適用於水位、GPS、伸縮計等各類訊號。")
 
 # --- 讀取與清理資料模組 ---
 @st.cache_data
@@ -57,10 +57,10 @@ if uploaded_file:
     st.sidebar.header("🎛️ 2. 濾波演算法設定")
     
     filter_options = [
-        "移動中位數檢定 (Hampel Filter) - 推薦！對付連續突波剋星",
-        "變化率過濾法 (Rate of Change) - 強制消除異常跳水",
-        "相鄰突變檢測 (僅抓單一獨立突波)",
-        "上下限絕對值過濾 (抓取超界值)"
+        "移動中位數檢定 (Hampel Filter)",
+        "變化率過濾法 (Rate of Change)",
+        "相鄰突變檢測 (僅抓單點突波)",
+        "上下限絕對值過濾"
     ]
     filter_method = st.sidebar.radio("選擇濾波方式", filter_options)
     
@@ -68,15 +68,13 @@ if uploaded_file:
     df_clean['is_outlier'] = False
     
     # 演算法 1：Hampel Filter
-    if filter_method == "移動中位數檢定 (Hampel Filter) - 推薦！對付連續突波剋星":
-        # 放大 window 上限至 2000，以應付大面積的區塊型當機或異常
-        window_size = st.sidebar.slider("移動視窗大小 (筆數)", min_value=5, max_value=2000, value=24, help="遇到連續較長的異常區塊時，請把此數值拉大 (例如拉到 100~500 以上)。")
-        z_score = st.sidebar.slider("嚴格程度 (Z-Score 倍數)", min_value=0.1, max_value=10.0, value=3.0, step=0.1, help="數值越小，過濾越嚴格。")
+    if filter_method == "移動中位數檢定 (Hampel Filter)":
+        window_size = st.sidebar.slider("移動視窗大小 (筆數)", min_value=5, max_value=2000, value=24)
+        z_score = st.sidebar.slider("嚴格程度 (Z-Score 倍數)", min_value=0.1, max_value=10.0, value=3.0, step=0.1)
         
         rolling_median = df_clean[target_col].rolling(window=window_size, center=True, min_periods=1).median()
         mad = (df_clean[target_col] - rolling_median).abs().rolling(window=window_size, center=True, min_periods=1).median()
         
-        # 使用極微小的容忍基準，適應精密儀器的微小數值變動
         base_tol = df[target_col].std() * 0.001 if pd.notnull(df[target_col].std()) else 1e-6
         threshold = np.maximum(z_score * 1.4826 * mad, base_tol)
         
@@ -84,14 +82,14 @@ if uploaded_file:
         df_clean.loc[diff > threshold, 'is_outlier'] = True
         
     # 演算法 2：變化率
-    elif filter_method == "變化率過濾法 (Rate of Change) - 強制消除異常跳水":
+    elif filter_method == "變化率過濾法 (Rate of Change)":
         suggested_jump = float(df[target_col].std()) if pd.notnull(df[target_col].std()) else 1.0
         max_jump = st.sidebar.number_input("允許的最大單步跳動量", value=suggested_jump, min_value=0.0001, step=0.01)
         diff_prev = (df_clean[target_col] - df_clean[target_col].shift(1)).abs()
         df_clean.loc[diff_prev > max_jump, 'is_outlier'] = True
 
     # 演算法 3：相鄰突變
-    elif filter_method == "相鄰突變檢測 (僅抓單一獨立突波)":
+    elif filter_method == "相鄰突變檢測 (僅抓單點突波)":
         suggested_jump = float(df[target_col].std() * 1.5) if pd.notnull(df[target_col].std()) else 1.0
         max_jump = st.sidebar.number_input("允許的最大瞬間跳動量", value=suggested_jump, min_value=0.0001, step=0.01)
         diff_prev = (df_clean[target_col] - df_clean[target_col].shift(1)).abs()
@@ -100,27 +98,50 @@ if uploaded_file:
         df_clean.loc[mask, 'is_outlier'] = True
 
     # 演算法 4：上下限
-    elif filter_method == "上下限絕對值過濾 (抓取超界值)":
+    elif filter_method == "上下限絕對值過濾":
         min_val = st.sidebar.number_input("合理最小值", value=float(df[target_col].min() - 5))
         max_val = st.sidebar.number_input("合理最大值", value=float(df[target_col].max() + 5))
         df_clean.loc[(df_clean[target_col] < min_val) | (df_clean[target_col] > max_val), 'is_outlier'] = True
 
-    # --- 新增功能：手動區間剔除 ---
+    # --- 新增功能：日曆與時間選擇器的手動區間剔除 ---
     st.sidebar.markdown("---")
     st.sidebar.header("✂️ 3. 手動指定異常區間 (選用)")
-    st.sidebar.write("若有儀器故障導致的大段異常，可直接輸入時間區間強制剔除。")
-    manual_remove = st.sidebar.text_area("輸入需剔除的時間區間 (格式: YYYY-MM-DD HH:MM ~ YYYY-MM-DD HH:MM)", 
-                                         placeholder="例如:\n2023-01-01 12:00 ~ 2023-01-05 00:00")
-    if manual_remove:
-        for line in manual_remove.split("\n"):
-            if "~" in line:
-                try:
-                    start_str, end_str = line.split("~")
-                    start_dt = pd.to_datetime(start_str.strip())
-                    end_dt = pd.to_datetime(end_str.strip())
-                    df_clean.loc[(df_clean[time_col] >= start_dt) & (df_clean[time_col] <= end_dt), 'is_outlier'] = True
-                except:
-                    pass
+    
+    # 使用 Session State 來記住使用者加入了哪些區間
+    if 'manual_ranges' not in st.session_state:
+        st.session_state.manual_ranges = []
+        
+    col_sd, col_st = st.sidebar.columns(2)
+    with col_sd:
+        m_start_date = st.date_input("開始日期", value=df[time_col].min().date())
+    with col_st:
+        m_start_time = st.time_input("開始時間", value=df[time_col].min().time())
+        
+    col_ed, col_et = st.sidebar.columns(2)
+    with col_ed:
+        m_end_date = st.date_input("結束日期", value=df[time_col].max().date())
+    with col_et:
+        m_end_time = st.time_input("結束時間", value=df[time_col].max().time())
+
+    if st.sidebar.button("➕ 加入剔除清單"):
+        m_start_dt = pd.to_datetime(f"{m_start_date} {m_start_time}")
+        m_end_dt = pd.to_datetime(f"{m_end_date} {m_end_time}")
+        if m_start_dt >= m_end_dt:
+            st.sidebar.error("開始時間必須早於結束時間！")
+        else:
+            st.session_state.manual_ranges.append((m_start_dt, m_end_dt))
+            st.rerun()
+
+    if st.session_state.manual_ranges:
+        st.sidebar.markdown("**已設定的剔除區間：**")
+        for i, (s, e) in enumerate(st.session_state.manual_ranges):
+            st.sidebar.caption(f"📍 {s.strftime('%Y-%m-%d %H:%M')} ~ {e.strftime('%Y-%m-%d %H:%M')}")
+            # 執行強制剔除
+            df_clean.loc[(df_clean[time_col] >= s) & (df_clean[time_col] <= e), 'is_outlier'] = True
+            
+        if st.sidebar.button("🗑️ 清空所有手動區間"):
+            st.session_state.manual_ranges = []
+            st.rerun()
 
     # --- 修復與平滑化 ---
     st.sidebar.markdown("---")
@@ -168,7 +189,6 @@ if uploaded_file:
     tab1, tab2 = st.tabs(["🔍 濾波效果比對 (含異常標記)", "✨ 修復後最終成果 (純淨歷線)"])
     
     with tab1:
-        st.write("淺藍色實線為修復後的資料；🔴 紅色點為被系統判定為異常並剔除的原始突波。")
         fig1 = go.Figure()
         fig1.add_trace(go.Scatter(x=df_clean[time_col], y=df_clean['Cleaned_Value'], mode='lines', name="修復後平滑資料", line=dict(color="#1f77b4", width=2)))
         df_outliers = df_clean[df_clean['is_outlier']]
@@ -181,7 +201,6 @@ if uploaded_file:
         st.plotly_chart(fig1, use_container_width=True, config={"scrollZoom": True})
 
     with tab2:
-        st.write("這是最終即將匯出的乾淨資料歷線，您可以清楚確認濾波與修補的效果是否符合預期。")
         fig2 = go.Figure()
         fig2.add_trace(go.Scatter(x=df_clean[time_col], y=df_clean['Cleaned_Value'], mode='lines', name="最終修復資料", line=dict(color="#1f77b4", width=2)))
             
